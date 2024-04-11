@@ -84,3 +84,17 @@ pub mod v2 {
         Ok(())
     }
 }
+
+// v3 is the one for Rakoff Token
+pub mod v3 {
+    use cosmwasm_std::{Decimal, DepsMut};
+
+    use crate::state::set_commission;
+
+    pub fn set_initial_commission(
+        deps: DepsMut,
+        val: Decimal,
+    ) -> Result<(), crate::ContractError>{
+        set_commission(deps.storage, val)
+    }
+}

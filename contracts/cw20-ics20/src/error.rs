@@ -65,6 +65,9 @@ pub enum ContractError {
 
     #[error("You can only send cw20 tokens that have been explicitly allowed by governance")]
     NotOnAllowList,
+
+    #[error("Invalid commission value")]
+    InvalidCommission,
 }
 
 impl From<FromUtf8Error> for ContractError {

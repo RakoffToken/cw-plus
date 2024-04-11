@@ -1,8 +1,7 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    from_binary, to_binary, Addr, Binary, Deps, DepsMut, Env, IbcMsg, IbcQuery, MessageInfo, Order,
-    PortIdResponse, Response, StdError, StdResult,
+    from_binary, to_binary, Addr, Binary, Coin, Decimal, Deps, DepsMut, Env, Fraction, IbcMsg, IbcQuery, MessageInfo, Order, PortIdResponse, Response, StdError, StdResult, Uint128
 };
 use semver::Version;
 
@@ -10,17 +9,16 @@ use cw2::{get_contract_version, set_contract_version};
 use cw20::{Cw20Coin, Cw20ReceiveMsg};
 use cw_storage_plus::Bound;
 
-use crate::amount::Amount;
+use crate::amount::{calculate_lock_in, Amount};
 use crate::error::ContractError;
 use crate::ibc::Ics20Packet;
-use crate::migrations::{v1, v2};
+use crate::migrations::{v1, v2, v3};
 use crate::msg::{
     AllowMsg, AllowedInfo, AllowedResponse, ChannelResponse, ConfigResponse, ExecuteMsg, InitMsg,
     ListAllowedResponse, ListChannelsResponse, MigrateMsg, PortResponse, QueryMsg, TransferMsg,
 };
 use crate::state::{
-    increase_channel_balance, AllowInfo, Config, ADMIN, ALLOW_LIST, CHANNEL_INFO, CHANNEL_STATE,
-    CONFIG,
+    get_commission, set_commission, increase_channel_balance, AllowInfo, Config, ADMIN, ALLOW_LIST, CHANNEL_INFO, CHANNEL_STATE, CONFIG
 };
 use cw_utils::{maybe_addr, nonpayable, one_coin};
 
@@ -53,6 +51,14 @@ pub fn instantiate(
         };
         ALLOW_LIST.save(deps.storage, &contract, &info)?;
     }
+
+    // set commission if provided
+    if let Some(comm) = msg.commission {
+        set_commission(deps.storage, comm)?;
+    } else {
+        set_commission(deps.storage, Decimal::zero())?;
+    }
+
     Ok(Response::default())
 }
 
@@ -110,8 +116,10 @@ pub fn execute_transfer(
     }
     let config = CONFIG.load(deps.storage)?;
 
+    let (lock_in_amount, transfer_amount) = calculate_lock_in(deps.as_ref(), amount)?;
+
     // if cw20 token, validate and ensure it is whitelisted, or we set default gas limit
-    if let Amount::Cw20(coin) = &amount {
+    if let Amount::Cw20(coin) = &transfer_amount {
         let addr = deps.api.addr_validate(&coin.address)?;
         // if limit is set, then we always allow cw20
         if config.default_gas_limit.is_none() {
@@ -131,8 +139,8 @@ pub fn execute_transfer(
 
     // build ics20 packet
     let packet = Ics20Packet::new(
-        amount.amount(),
-        amount.denom(),
+        transfer_amount.amount(),
+        transfer_amount.denom(),
         sender.as_ref(),
         &msg.remote_address,
     );
@@ -141,7 +149,7 @@ pub fn execute_transfer(
     // Update the balance now (optimistically) like ibctransfer modules.
     // In on_packet_failure (ack with error message or a timeout), we reduce the balance appropriately.
     // This means the channel works fine if success acks are not relayed.
-    increase_channel_balance(deps.storage, &msg.channel, &amount.denom(), amount.amount())?;
+    increase_channel_balance(deps.storage, &msg.channel, &transfer_amount.denom(), transfer_amount.amount())?;
 
     // prepare ibc message
     let msg = IbcMsg::SendPacket {
@@ -149,6 +157,10 @@ pub fn execute_transfer(
         data: to_binary(&packet)?,
         timeout: timeout.into(),
     };
+
+    // prepare lock in
+    let beneficiary = ADMIN.get(deps.as_ref())?.unwrap_or_else(|| Addr::unchecked(""));
+    let lock_in_msg = lock_in_amount.into_cosmos_msg(beneficiary)?;
 
     // send response
     let res = Response::new()
@@ -158,7 +170,12 @@ pub fn execute_transfer(
         .add_attribute("receiver", &packet.receiver)
         .add_attribute("denom", &packet.denom)
         .add_attribute("amount", &packet.amount.to_string());
-    Ok(res)
+
+    // add lock in transfer optionally
+    match lock_in_msg {
+        Some(lock_in_msg) => Ok(res.add_message(lock_in_msg)),
+        None => Ok(res),
+    }
 }
 
 /// The gov contract can allow new contracts, or increase the gas limit on existing contracts.
@@ -206,6 +223,7 @@ const MIGRATE_MIN_VERSION: &str = "0.11.1";
 const MIGRATE_VERSION_2: &str = "0.12.0-alpha1";
 // the new functionality starts in 0.13.1, this is the last release that needs to be migrated to v3
 const MIGRATE_VERSION_3: &str = "0.13.0";
+const MIGRATE_VERSION_4: &str = "1.0.0";
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn migrate(mut deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response, ContractError> {
@@ -247,7 +265,14 @@ pub fn migrate(mut deps: DepsMut, env: Env, msg: MigrateMsg) -> Result<Response,
     if storage_version <= MIGRATE_VERSION_3.parse().map_err(from_semver)? {
         v2::update_balances(deps.branch(), &env)?;
     }
+    // run the v3->v4 converstion if we are v3 style
+    if storage_version <= MIGRATE_VERSION_4.parse().map_err(from_semver)? {
+        let comm = msg.commission.unwrap_or(Decimal::zero());
+        v3::set_initial_commission(deps.branch(), comm)?;
+    }
     // otherwise no migration (yet) - add them here
+
+    //if storage_ver
 
     // always allow setting the default gas limit via MigrateMsg, even if same version
     // (Note this doesn't allow unsetting it now)
@@ -383,9 +408,10 @@ mod test {
     use crate::test_helpers::*;
 
     use cosmwasm_std::testing::{mock_env, mock_info, MOCK_CONTRACT_ADDR};
-    use cosmwasm_std::{coin, coins, CosmosMsg, IbcMsg, StdError, Uint128};
+    use cosmwasm_std::{coin, coins, BankMsg, CosmosMsg, IbcMsg, StdError, Uint128, WasmMsg};
+    use cw20::Cw20ExecuteMsg;
 
-    use crate::state::ChannelState;
+    use crate::state::{get_commission, ChannelState};
     use cw_utils::PaymentError;
 
     #[test]
@@ -556,6 +582,7 @@ mod test {
             mock_env(),
             MigrateMsg {
                 default_gas_limit: Some(123456),
+                commission: None,
             },
         )
         .unwrap();
@@ -595,6 +622,7 @@ mod test {
             mock_env(),
             MigrateMsg {
                 default_gas_limit: Some(123456),
+                commission: None,
             },
         )
         .unwrap();
@@ -607,5 +635,220 @@ mod test {
         // check config updates
         let config = query_config(deps.as_ref()).unwrap();
         assert_eq!(config.default_gas_limit, Some(123456));
+    }
+
+    #[test]
+    fn assert_v4_version_is_bigger_than_v3() {
+        let v3 = Version::parse(MIGRATE_VERSION_3).unwrap();
+        let v4 = Version::parse(MIGRATE_VERSION_4).unwrap();
+        let new = Version::parse("1.0.0+rakoff001").unwrap();
+        let new2 = Version::parse("1.0.0+rakoff011").unwrap();
+        assert!(v4 > v3);
+        assert!(new > v4);
+        assert!(new2 > new);
+    }
+
+    #[test]
+    fn v4_migration_works_with_explicit_comm() {
+        let mut deps = setup(&[], &[]);
+
+        // pretend this is an old contract - set version explicitly
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, MIGRATE_VERSION_4).unwrap();
+
+        // channel state a bit lower (some in-flight acks)
+        let state = ChannelState {
+            // 14000 not accounted for (in-flight)
+            outstanding: Uint128::new(36000),
+            total_sent: Uint128::new(100000),
+        };
+
+        // run migration
+        migrate(
+            deps.as_mut(),
+            mock_env(),
+            MigrateMsg {
+                default_gas_limit: Some(123456),
+                commission: Some(Decimal::percent(1)),
+            },
+        )
+        .unwrap();
+
+        // check new commission
+        let comm = get_commission(&deps.storage).unwrap();
+        assert_eq!(comm, Decimal::percent(1));
+
+    }
+
+    #[test]
+    fn v4_migration_works_without_explicit_comm() {
+        let mut deps = setup(&[], &[]);
+
+        // pretend this is an old contract - set version explicitly
+        set_contract_version(deps.as_mut().storage, CONTRACT_NAME, MIGRATE_VERSION_4).unwrap();
+
+        // channel state a bit lower (some in-flight acks)
+        let state = ChannelState {
+            // 14000 not accounted for (in-flight)
+            outstanding: Uint128::new(36000),
+            total_sent: Uint128::new(100000),
+        };
+
+        // run migration
+        migrate(
+            deps.as_mut(),
+            mock_env(),
+            MigrateMsg {
+                default_gas_limit: Some(123456),
+                commission: None,
+            },
+        )
+        .unwrap();
+
+        // check new commission
+        let comm = get_commission(&deps.storage).unwrap();
+        assert_eq!(comm, Decimal::percent(0));
+
+    }
+
+    #[test]
+    fn propoer_checks_on_execute_cw20_with_lock_in() {
+        let send_channel = "channel-15";
+        let cw20_addr = "my-token";
+        let mut deps = setup_with_lock_in(&["channel-3", send_channel], &[(cw20_addr, 123456)], Decimal::percent(10));
+
+        let transfer = TransferMsg {
+            channel: send_channel.to_string(),
+            remote_address: "foreign-address".to_string(),
+            timeout: Some(7777),
+        };
+        let msg = ExecuteMsg::Receive(Cw20ReceiveMsg {
+            sender: "my-account".into(),
+            amount: Uint128::new(888777666),
+            msg: to_binary(&transfer).unwrap(),
+        });
+
+        // works with proper funds
+        let info = mock_info(cw20_addr, &[]);
+        let res = execute(deps.as_mut(), mock_env(), info, msg.clone()).unwrap();
+        assert_eq!(2, res.messages.len());
+        assert_eq!(res.messages[0].gas_limit, None);
+        
+        if let CosmosMsg::Ibc(IbcMsg::SendPacket {
+            channel_id,
+            data,
+            timeout,
+        }) = &res.messages[0].msg
+        {
+            let expected_timeout = mock_env().block.time.plus_seconds(7777);
+            assert_eq!(timeout, &expected_timeout.into());
+            assert_eq!(channel_id.as_str(), send_channel);
+            let msg: Ics20Packet = from_binary(data).unwrap();
+            assert_eq!(msg.amount, Uint128::new(799899899));
+            assert_eq!(msg.denom, format!("cw20:{}", cw20_addr));
+            assert_eq!(msg.sender.as_str(), "my-account");
+            assert_eq!(msg.receiver.as_str(), "foreign-address");
+        } else {
+            panic!("Unexpected return message: {:?}", res.messages[0]);
+        }
+
+        let expected_beneficiary = ADMIN.get(deps.as_ref()).unwrap().unwrap();
+        let expected_cw20_msg = to_binary(&cw20::Cw20ExecuteMsg::Transfer {
+            recipient: expected_beneficiary.into_string(),
+            amount: Uint128::new(88877767),
+        }).unwrap();
+        let expected_funds:Vec<Coin> = vec![];
+
+        // check cw20 lock in
+        if let CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr,
+            msg,
+            funds, 
+        }) = &res.messages[1].msg
+        {
+            assert_eq!(msg, &expected_cw20_msg);
+            assert_eq!(funds, &expected_funds);
+            assert_eq!(contract_addr, cw20_addr);
+        } else {
+            panic!("Unexpected return message: {:?}", res.messages[1]);
+        }
+
+        // reject with tokens funds
+        let info = mock_info("foobar", &coins(1234567, "ucosm"));
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(err, ContractError::Payment(PaymentError::NonPayable {}));
+
+    }
+
+    #[test]
+    fn proper_checks_on_execute_native_with_lock_in() {
+        let send_channel = "channel-5";
+        let mut deps = setup_with_lock_in(&[send_channel, "channel-10"], &[], Decimal::percent(10));
+
+        let mut transfer = TransferMsg {
+            channel: send_channel.to_string(),
+            remote_address: "foreign-address".to_string(),
+            timeout: None,
+        };
+
+        // works with proper funds
+        let msg = ExecuteMsg::Transfer(transfer.clone());
+        let info = mock_info("foobar", &coins(1234567, "ucosm"));
+        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(res.messages[0].gas_limit, None);
+        assert_eq!(2, res.messages.len());
+        if let CosmosMsg::Ibc(IbcMsg::SendPacket {
+            channel_id,
+            data,
+            timeout,
+        }) = &res.messages[0].msg
+        {
+            let expected_timeout = mock_env().block.time.plus_seconds(DEFAULT_TIMEOUT);
+            assert_eq!(timeout, &expected_timeout.into());
+            assert_eq!(channel_id.as_str(), send_channel);
+            let msg: Ics20Packet = from_binary(data).unwrap();
+            assert_eq!(msg.amount, Uint128::new(1111110));
+            assert_eq!(msg.denom.as_str(), "ucosm");
+            assert_eq!(msg.sender.as_str(), "foobar");
+            assert_eq!(msg.receiver.as_str(), "foreign-address");
+        } else {
+            panic!("Unexpected return message: {:?}", res.messages[0]);
+        }
+
+        // transfer 10% to lock in
+        let expected_beneficiary = ADMIN.get(deps.as_ref()).unwrap().unwrap();
+        if let CosmosMsg::Bank(BankMsg::Send {
+            to_address,
+            amount,
+        }) = &res.messages[1].msg
+        {
+            assert_eq!(to_address, expected_beneficiary.as_str());
+            assert_eq!(amount, &coins(123457, "ucosm"));
+        } else {
+            panic!("Unexpected return message: {:?}", res.messages[1]);
+        }
+
+        // reject with no funds
+        let msg = ExecuteMsg::Transfer(transfer.clone());
+        let info = mock_info("foobar", &[]);
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(err, ContractError::Payment(PaymentError::NoFunds {}));
+
+        // reject with multiple tokens funds
+        let msg = ExecuteMsg::Transfer(transfer.clone());
+        let info = mock_info("foobar", &[coin(1234567, "ucosm"), coin(54321, "uatom")]);
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(err, ContractError::Payment(PaymentError::MultipleDenoms {}));
+
+        // reject with bad channel id
+        transfer.channel = "channel-45".to_string();
+        let msg = ExecuteMsg::Transfer(transfer);
+        let info = mock_info("foobar", &coins(1234567, "ucosm"));
+        let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
+        assert_eq!(
+            err,
+            ContractError::NoSuchChannel {
+                id: "channel-45".to_string()
+            }
+        );
     }
 }

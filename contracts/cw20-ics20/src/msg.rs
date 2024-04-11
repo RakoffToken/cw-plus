@@ -1,4 +1,5 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
+use cosmwasm_std::Decimal;
 use cw20::Cw20ReceiveMsg;
 
 use crate::amount::Amount;
@@ -15,6 +16,7 @@ pub struct InitMsg {
     /// If set, contracts off the allowlist will run with this gas limit.
     /// If unset, will refuse to accept any contract off the allow list.
     pub default_gas_limit: Option<u64>,
+    pub commission: Option<Decimal>,
 }
 
 #[cw_serde]
@@ -26,6 +28,7 @@ pub struct AllowMsg {
 #[cw_serde]
 pub struct MigrateMsg {
     pub default_gas_limit: Option<u64>,
+    pub commission: Option<Decimal>,
 }
 
 #[cw_serde]

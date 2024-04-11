@@ -8,7 +8,7 @@ use cosmwasm_std::testing::{
     mock_dependencies, mock_env, mock_info, MockApi, MockQuerier, MockStorage,
 };
 use cosmwasm_std::{
-    DepsMut, IbcChannel, IbcChannelConnectMsg, IbcChannelOpenMsg, IbcEndpoint, OwnedDeps,
+    Decimal, DepsMut, IbcChannel, IbcChannelConnectMsg, IbcChannelOpenMsg, IbcEndpoint, OwnedDeps
 };
 
 use crate::msg::{AllowMsg, InitMsg};
@@ -74,6 +74,40 @@ pub fn setup(
         default_timeout: DEFAULT_TIMEOUT,
         gov_contract: "gov".to_string(),
         allowlist,
+        commission: None,
+    };
+    let info = mock_info(&String::from("anyone"), &[]);
+    let res = instantiate(deps.as_mut(), mock_env(), info, instantiate_msg).unwrap();
+    assert_eq!(0, res.messages.len());
+
+    for channel in channels {
+        add_channel(deps.as_mut(), channel);
+    }
+    deps
+}
+
+pub fn setup_with_lock_in(
+    channels: &[&str],
+    allow: &[(&str, u64)],
+    commission: Decimal,
+) -> OwnedDeps<MockStorage, MockApi, MockQuerier> {
+    let mut deps = mock_dependencies();
+
+    let allowlist = allow
+        .iter()
+        .map(|(contract, gas)| AllowMsg {
+            contract: contract.to_string(),
+            gas_limit: Some(*gas),
+        })
+        .collect();
+
+    // instantiate an empty contract
+    let instantiate_msg = InitMsg {
+        default_gas_limit: None,
+        default_timeout: DEFAULT_TIMEOUT,
+        gov_contract: "gov".to_string(),
+        allowlist,
+        commission: Some(commission),
     };
     let info = mock_info(&String::from("anyone"), &[]);
     let res = instantiate(deps.as_mut(), mock_env(), info, instantiate_msg).unwrap();

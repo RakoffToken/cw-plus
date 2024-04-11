@@ -1,9 +1,10 @@
 use cosmwasm_schema::cw_serde;
-use cosmwasm_std::{Addr, IbcEndpoint, StdResult, Storage, Uint128};
+use cosmwasm_std::{Addr, Decimal, IbcEndpoint, StdError, StdResult, Storage, Uint128};
 use cw_controllers::Admin;
 use cw_storage_plus::{Item, Map};
 
 use crate::ContractError;
+use cosmwasm_std::testing::{mock_dependencies, mock_env};
 
 pub const ADMIN: Admin = Admin::new("admin");
 
@@ -20,6 +21,9 @@ pub const CHANNEL_STATE: Map<(&str, &str), ChannelState> = Map::new("channel_sta
 
 /// Every cw20 contract we allow to be sent is stored here, possibly with a gas_limit
 pub const ALLOW_LIST: Map<&Addr, AllowInfo> = Map::new("allow_list");
+
+/// A commission fee that is taken on every send
+pub const COMMISSION: Item<Decimal> = Item::new("commission");
 
 #[cw_serde]
 #[derive(Default)]
@@ -107,4 +111,43 @@ pub fn undo_reduce_channel_balance(
         Ok(state)
     })?;
     Ok(())
+}
+
+pub fn set_commission(
+    storage: &mut dyn Storage,
+    commission: Decimal
+) -> Result<(), ContractError> {
+    if commission.lt(&Decimal::zero()) || commission.gt(&Decimal::one()) {
+        return Err(ContractError::InvalidCommission);
+    }
+    COMMISSION.save(storage, &commission)
+        .map_err(|_| ContractError::Std(
+            StdError::generic_err("error saving commission")
+        ))
+}
+
+pub fn get_commission(storage: &dyn Storage) -> StdResult<Decimal> {
+    COMMISSION.load(storage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_set_commission() {
+        let mut deps = mock_dependencies();
+        let mut storage = deps.storage;
+
+        // Test valid commission
+        let commission = Decimal::from_ratio(1u32, 10u32);
+        let res = set_commission(&mut storage, commission);
+        assert_eq!(res, Ok(()));
+
+        // Test invalid commission
+        let invalid_commission = Decimal::from_ratio(200u32, 100u32);
+        let res = set_commission(&mut storage, invalid_commission);
+        assert_eq!(res, Err(ContractError::InvalidCommission));
+
+    }
+
 }

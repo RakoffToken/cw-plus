@@ -648,6 +648,7 @@ mod test {
             mock_env(),
             MigrateMsg {
                 default_gas_limit: Some(def_limit),
+                commission: None,
             },
         )
         .unwrap();
