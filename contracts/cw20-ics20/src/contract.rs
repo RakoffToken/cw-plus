@@ -79,7 +79,12 @@ pub fn execute(
         ExecuteMsg::UpdateAdmin { admin } => {
             let admin = deps.api.addr_validate(&admin)?;
             Ok(ADMIN.execute_update_admin(deps, info, Some(admin))?)
-        }
+        },
+        ExecuteMsg::UpdateCommission { commission } => {
+            ADMIN.assert_admin(deps.as_ref(), &info.sender)?;
+            set_commission(deps.storage, commission)?;
+            Ok(Response::new())
+        },
     }
 }
 
@@ -410,6 +415,7 @@ mod test {
     use cosmwasm_std::testing::{mock_env, mock_info, MOCK_CONTRACT_ADDR};
     use cosmwasm_std::{coin, coins, BankMsg, CosmosMsg, IbcMsg, StdError, Uint128, WasmMsg};
     use cw20::Cw20ExecuteMsg;
+    use cw_controllers::AdminError;
 
     use crate::state::{get_commission, ChannelState};
     use cw_utils::PaymentError;
@@ -850,5 +856,32 @@ mod test {
                 id: "channel-45".to_string()
             }
         );
+    }
+
+    #[test]
+    fn update_commission_works() {
+        let mut deps = setup(&[], &[]);
+        let comm = Decimal::percent(1);
+        let info = mock_info("gov", &[]);
+        let msg = ExecuteMsg::UpdateCommission { commission: comm };
+        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(res.attributes.len(), 0);
+
+        let cfg = CONFIG.load(deps.as_ref().storage).unwrap();
+        assert_eq!(cfg.default_timeout, DEFAULT_TIMEOUT);
+        assert_eq!(cfg.default_gas_limit, None);
+
+        let comm = get_commission(deps.as_ref().storage).unwrap();
+        assert_eq!(comm, Decimal::percent(1));
+    }
+
+    #[test]
+    fn update_commission_does_not_work_from_non_admin() {
+        let mut deps = setup(&[], &[]);
+        let comm = Decimal::percent(1);
+        let info = mock_info("fake_admin", &[]);
+        let msg = ExecuteMsg::UpdateCommission { commission: comm };
+        let res = execute(deps.as_mut(), mock_env(), info, msg);
+        assert_eq!(res.unwrap_err(), ContractError::Admin(AdminError::NotAdmin {  }));
     }
 }

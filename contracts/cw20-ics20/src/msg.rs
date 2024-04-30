@@ -41,6 +41,8 @@ pub enum ExecuteMsg {
     Allow(AllowMsg),
     /// Change the admin (must be called by current admin)
     UpdateAdmin { admin: String },
+    /// Change the commission
+    UpdateCommission { commission: Decimal},
 }
 
 /// This is the message we accept via Receive
