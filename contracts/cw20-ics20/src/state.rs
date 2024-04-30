@@ -4,7 +4,6 @@ use cw_controllers::Admin;
 use cw_storage_plus::{Item, Map};
 
 use crate::ContractError;
-use cosmwasm_std::testing::{mock_dependencies, mock_env};
 
 pub const ADMIN: Admin = Admin::new("admin");
 
@@ -133,6 +132,7 @@ pub fn get_commission(storage: &dyn Storage) -> StdResult<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmwasm_std::testing::{mock_dependencies, mock_env};
     #[test]
     fn test_set_commission() {
         let mut deps = mock_dependencies();
