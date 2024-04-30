@@ -778,6 +778,11 @@ mod test {
             panic!("Unexpected return message: {:?}", res.messages[1]);
         }
 
+        // check channel balance matches transferred minus the lock-in
+        // so we do not lock too much tokens into the bridge contract
+        let chan = query_channel(deps.as_ref(), send_channel.into()).unwrap();
+        assert_eq!(chan.balances, vec![Amount::cw20(799899899, "my-token")]);
+
         // reject with tokens funds
         let info = mock_info("foobar", &coins(1234567, "ucosm"));
         let err = execute(deps.as_mut(), mock_env(), info, msg).unwrap_err();
@@ -832,6 +837,11 @@ mod test {
         } else {
             panic!("Unexpected return message: {:?}", res.messages[1]);
         }
+
+        // check channel balance matches transferred minus the lock-in
+        // so we do not lock too much tokens into the bridge contract
+        let chan = query_channel(deps.as_ref(), send_channel.into()).unwrap();
+        assert_eq!(chan.balances, vec![Amount::native(1111110, "ucosm")]);
 
         // reject with no funds
         let msg = ExecuteMsg::Transfer(transfer.clone());
